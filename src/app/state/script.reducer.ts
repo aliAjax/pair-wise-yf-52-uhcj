@@ -1,80 +1,147 @@
 import { createReducer, on } from '@ngrx/store';
-import { addVersion, activateVersion, reorderLines, reviewCue, reviewLine, setOnline, toggleRehearsal } from './script.actions';
+import {
+  activateVersion,
+  addVersion,
+  discardOutboxItem,
+  importLegacyArchive,
+  mergePlaywrightDraft,
+  recordQuestion,
+  replayQuestions,
+  resolveLineConflict,
+  reviewCue,
+  reviewLine,
+  setOnline,
+  toggleRehearsal,
+} from './script.actions';
+import {
+  loadState,
+  mergeDraftIntoVersion,
+  migrateState,
+  replayOutbox,
+  resolveConflict,
+} from './script.merge';
+import { ActorQuestion, LegacyVersionShape, OutboxQuestion, ScriptState, ScriptVersion } from './script.model';
 
-export type CueDecision = 'pending' | 'accepted' | 'returned';
-
-export interface ScriptVersion {
-  id: string;
-  label: string;
-  playwright: string;
-  note: string;
-  lines: Array<{ id: string; role: string; text: string; status: 'pending' | 'accepted' | 'returned' }>;
-  cues: Array<{ id: string; scene: string; text: string; status: CueDecision }>;
+function activeVersion(state: ScriptState): ScriptVersion | undefined {
+  return state.versions.find((version) => version.id === state.activeVersionId);
 }
 
-export interface ScriptState {
-  versions: ScriptVersion[];
-  activeVersionId: string;
-  rehearsalMode: boolean;
-  online: boolean;
+function patchActiveVersion(state: ScriptState, patch: (version: ScriptVersion) => ScriptVersion): ScriptState {
+  return {
+    ...state,
+    versions: state.versions.map((version) => (version.id === state.activeVersionId ? patch(version) : version)),
+  };
 }
 
-const initialVersions: ScriptVersion[] = [
-  {
-    id: 'v12', label: '排练稿 v12', playwright: '林编剧', note: '重写第三场父女冲突，舞台灯光提示延后2拍。',
-    lines: [
-      { id: 'l1', role: '周岚', text: '你每次都说等明天，可舞台不会等我们。', status: 'pending' },
-      { id: 'l2', role: '周野', text: '那就让灯灭吧，我早已背熟黑暗。', status: 'pending' }
-    ],
-    cues: [
-      { id: 'c1', scene: '第三场', text: '侧灯收至30%，雨声渐入', status: 'pending' },
-      { id: 'c2', scene: '第三场', text: '周野坐到舞台左前区，保留两拍静默', status: 'accepted' }
-    ]
-  },
-  {
-    id: 'v13', label: '导演修订 v13', playwright: '林编剧', note: '调整周岚结论，加入一次性追光变化。',
-    lines: [
-      { id: 'l1', role: '周岚', text: '你总说明天，但今晚我们必须把话说完。', status: 'pending' },
-      { id: 'l3', role: '周岚', text: '看着灯，再说一次你为什么回来。', status: 'pending' }
-    ],
-    cues: [{ id: 'c3', scene: '第三场', text: '追光由冷白切换至琥珀，等待雨声下落', status: 'pending' }]
-  }
-];
-
-function getInitialState(): ScriptState {
-  if (typeof localStorage === 'undefined') return { versions: initialVersions, activeVersionId: 'v12', rehearsalMode: false, online: true };
-  const saved = localStorage.getItem('yf52-script-state');
-  return saved ? JSON.parse(saved) as ScriptState : { versions: initialVersions, activeVersionId: 'v12', rehearsalMode: false, online: true };
+/** 下结论时记录结论针对的文本快照，供下一轮三路合并判断“两边都动过”。 */
+function applyLineDecision(version: ScriptVersion, id: string, decision: ScriptVersion['lines'][number]['status']): ScriptVersion {
+  return {
+    ...version,
+    lines: version.lines.map((line) =>
+      line.id === id ? { ...line, status: decision, decidedText: decision === 'pending' ? undefined : line.text } : line,
+    ),
+  };
 }
 
 export const scriptReducer = createReducer(
-  getInitialState(),
+  loadState(),
   on(addVersion, (state, { version }) => ({ ...state, versions: [...state.versions, version] })),
-  on(activateVersion, (state, { id }) => ({ ...state, activeVersionId: id })),
-  on(reviewLine, (state, { id, decision }) => ({
-    ...state,
-    versions: state.versions.map((version) => version.id !== state.activeVersionId ? version : ({
+  on(activateVersion, (state, { id }) =>
+    state.versions.some((version) => version.id === id) ? { ...state, activeVersionId: id } : state,
+  ),
+
+  on(reviewLine, (state, { id, decision }) =>
+    state.activeVersionId ? patchActiveVersion(state, (version) => applyLineDecision(version, id, decision)) : state,
+  ),
+  on(reviewCue, (state, { id, decision }) =>
+    patchActiveVersion(state, (version) => ({
       ...version,
-      lines: version.lines.map((line) => line.id === id ? { ...line, status: decision } : line)
-    }))
-  })),
-  on(reorderLines, (state, { from, to }) => ({
+      cues: version.cues.map((cue) => (cue.id === id ? { ...cue, status: decision } : cue)),
+    })),
+  ),
+
+  on(mergePlaywrightDraft, (state, { draft }) => {
+    const current = activeVersion(state);
+    if (!current) return state;
+    const result = mergeDraftIntoVersion(current, draft);
+    return {
+      ...state,
+      revisionSeq: Math.max(state.revisionSeq, draft.revisionSeq + 1),
+      versions: state.versions.map((version) => (version.id === current.id ? result.version : version)),
+    };
+  }),
+  on(resolveLineConflict, (state, { lineId, choice }) =>
+    patchActiveVersion(state, (version) => resolveConflict(version, lineId, choice)),
+  ),
+
+  on(recordQuestion, (state, { lineId, actor, note }) => {
+    const version = activeVersion(state);
+    const line = version?.lines.find((item) => item.id === lineId);
+    if (!version || !line) return state;
+
+    const seq = state.revisionSeq;
+    const base: ActorQuestion = {
+      id: `q-${seq}-${stableShortId()}`,
+      actor,
+      note,
+      lineTextAtRecord: line.text,
+      revisionSeq: seq,
+      recordedAt: Date.now(),
+    };
+
+    if (state.online) {
+      // 在线：疑问立即挂到当前版本的行上。
+      return {
+        ...patchActiveVersion(state, (item) => ({
+          ...item,
+          lines: item.lines.map((target) =>
+            target.id === lineId ? { ...target, questions: [...target.questions, { ...base }] } : target,
+          ),
+        })),
+        revisionSeq: seq + 1,
+      };
+    }
+
+    // 离线：排队，携带目标版本/行与记录时的修订序号，恢复后按号重放。
+    const queued: OutboxQuestion = {
+      ...base,
+      targetVersionId: version.id,
+      targetLineId: lineId,
+      state: 'queued',
+    };
+    return { ...state, outbox: [...state.outbox, queued], revisionSeq: seq + 1 };
+  }),
+  on(replayQuestions, (state) => replayOutbox(state).state),
+  on(discardOutboxItem, (state, { id }) => ({
     ...state,
-    versions: state.versions.map((version) => {
-      if (version.id !== state.activeVersionId || from === to) return version;
-      const lines = [...version.lines];
-      const [moved] = lines.splice(from, 1);
-      lines.splice(to, 0, moved);
-      return { ...version, lines };
-    })
+    outbox: state.outbox.map((item) => (item.id === id ? { ...item, state: 'discarded' as const } : item)),
   })),
-  on(reviewCue, (state, { id, decision }) => ({
-    ...state,
-    versions: state.versions.map((version) => version.id !== state.activeVersionId ? version : ({
-      ...version,
-      cues: version.cues.map((cue) => cue.id === id ? { ...cue, status: decision } : cue)
-    }))
-  })),
+
+  on(importLegacyArchive, (state, { archive }) => {
+    const rawVersions: LegacyVersionShape[] = Array.isArray((archive as { versions?: LegacyVersionShape[] }).versions)
+      ? (archive as { versions: LegacyVersionShape[] }).versions
+      : [archive as LegacyVersionShape];
+    // 借迁移器整体走一遍，保证无标记行补派稳定 id、baseText 回填。
+    const migrated = migrateState({ versions: rawVersions });
+    // 避免 id 与现有版本碰撞。
+    const versions = migrated.versions.map((version, index) =>
+      state.versions.some((item) => item.id === version.id)
+        ? { ...version, id: `${version.id}-imp-${Date.now().toString(36)}-${index}` }
+        : version,
+    );
+    return { ...state, versions: [...state.versions, ...versions], activeVersionId: versions[versions.length - 1]?.id ?? state.activeVersionId };
+  }),
+
   on(toggleRehearsal, (state) => ({ ...state, rehearsalMode: !state.rehearsalMode })),
-  on(setOnline, (state, { online }) => ({ ...state, online }))
+  on(setOnline, (state, { online }) => {
+    if (!online || !state.outbox.some((item) => item.state === 'queued')) return { ...state, online };
+    // 浏览器恢复在线的瞬间自动按修订序号重放离线疑问。
+    const replayed = replayOutbox({ ...state, online });
+    return { ...replayed.state, online };
+  }),
 );
+
+function stableShortId(): string {
+  // 仅用于生成不冲突的疑问 id；内容归属由 revisionSeq 保证。
+  return Math.random().toString(36).slice(2, 8);
+}
