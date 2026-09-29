@@ -6,6 +6,7 @@
     "dev": "ng serve --host 0.0.0.0 --port 62017",
     "start": "ng serve --host 0.0.0.0 --port 62017",
     "build": "ng build",
+    "spec": "mkdir -p node_modules/.cache && esbuild tests/merge.spec.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/spec.mjs && node node_modules/.cache/spec.mjs",
     "preview": "npx http-server dist/pair-wise-yf-52/browser -p 62017"
   },
   "dependencies": {
